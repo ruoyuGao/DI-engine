@@ -6,7 +6,7 @@ mobile_dqn_config = dict(
         collector_env_num=8,
         evaluator_env_num=8,
         n_evaluator_episode=8,
-        # stop_value=20,
+        stop_value=100000,
         env_id='Boxworld-v0',
         #'ALE/Pong-v5' is available. But special setting is needed after gym make.
         # frame_stack=4,
