@@ -72,14 +72,15 @@ class DQNAgent:
         self.policy = DQNPolicy(self.cfg.policy, model=model)
         if policy_state_dict is not None:
             self.policy.learn_mode.load_state_dict(policy_state_dict)
-        self.checkpoint_save_dir = os.path.join(self.exp_name, "ckpt")
+        path = "/mnt/nfs/gaoruoyu"
+        self.checkpoint_save_dir = os.path.join(path, self.exp_name, "ckpt")
 
     def train(
         self,
         step: int = int(1e7),
         collector_env_num: int = 4,
         evaluator_env_num: int = 4,
-        n_iter_save_ckpt: int = 1000,
+        n_iter_save_ckpt: int = 100000,
         context: Optional[str] = None,
         debug: bool = False,
         wandb_sweep: bool = False,
@@ -243,6 +244,8 @@ class DQNAgent:
 
     @property
     def best(self):
+        print("xxxxx")
+        print(os.path.join(self.checkpoint_save_dir, "eval.pth.tar"))
         best_model_file_path = os.path.join(self.checkpoint_save_dir, "eval.pth.tar")
         # Load best model if it exists
         if os.path.exists(best_model_file_path):
