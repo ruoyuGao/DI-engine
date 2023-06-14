@@ -7,28 +7,24 @@ from functools import partial
 import torch
 import treetensor.torch as ttorch
 from ding.framework import task, OnlineRLContext
-from ding.framework.middleware import CkptSaver, multistep_trainer, \
-    wandb_online_logger, offline_data_saver, termination_checker, interaction_evaluator, StepCollector, data_pusher, \
-    OffPolicyLearner, final_ctx_saver, nstep_reward_enhancer, eps_greedy_handler
+from ding.framework.middleware import CkptSaver, final_ctx_saver, OffPolicyLearner, StepCollector, \
+    wandb_online_logger, offline_data_saver, termination_checker, interaction_evaluator, gae_estimator
 from ding.envs import BaseEnv, BaseEnvManagerV2, SubprocessEnvManagerV2
-from ding.policy import DQNPolicy
+from ding.policy import PPOOffPolicy
 from ding.utils import set_pkg_seed
-from ding.config import save_config_py, compile_config
-from ding.model import DQN
+from ding.config import Config, save_config_py, compile_config
+from ding.model import VAC
 from ding.model import model_wrap
 from ding.data import DequeBuffer
 from ding.bonus.config import get_instance_config, get_instance_env
 from ding.bonus.common import TrainingReturn, EvalReturn
 
 
-class DQNAgent:
+class PPOOffPolicyAgent:
     supported_env_list = [
         'lunarlander_discrete',
-        'PongNoFrameskip',
-        'SpaceInvadersNoFrameskip',
-        'QbertNoFrameskip',
     ]
-    algorithm = 'DQN'
+    algorithm = 'PPOOffPolicy'
 
     def __init__(
             self,
@@ -40,23 +36,23 @@ class DQNAgent:
             policy_state_dict: str = None,
     ) -> None:
         if isinstance(env, str):
-            assert env in DQNAgent.supported_env_list, "Please use supported envs: {}".format(
-                DQNAgent.supported_env_list
+            assert env in PPOOffPolicyAgent.supported_env_list, "Please use supported envs: {}".format(
+                PPOOffPolicyAgent.supported_env_list
             )
             self.env = get_instance_env(env)
             if cfg is None:
                 # 'It should be default env tuned config'
-                cfg = get_instance_config(env, algorithm=DQNAgent.algorithm)
+                cfg = get_instance_config(env, algorithm=PPOOffPolicyAgent.algorithm)
             else:
                 assert isinstance(cfg, EasyDict), "Please use EasyDict as config data type."
 
             if exp_name is not None:
                 cfg.exp_name = exp_name
-            self.cfg = compile_config(cfg, policy=DQNPolicy)
+            self.cfg = compile_config(cfg, policy=PPOOffPolicy)
             self.exp_name = self.cfg.exp_name
 
         elif isinstance(env, BaseEnv):
-            self.cfg = compile_config(cfg, policy=DQNPolicy)
+            self.cfg = compile_config(cfg, policy=PPOOffPolicy)
             raise NotImplementedError
         else:
             raise TypeError("not support env type: {}, only strings and instances of `BaseEnv` now".format(type(env)))
@@ -67,20 +63,20 @@ class DQNAgent:
             os.makedirs(self.exp_name)
         save_config_py(self.cfg, os.path.join(self.exp_name, 'policy_config.py'))
         if model is None:
-            model = DQN(**self.cfg.policy.model)
+            model = VAC(**self.cfg.policy.model)
         self.buffer_ = DequeBuffer(size=self.cfg.policy.other.replay_buffer.replay_buffer_size)
-        self.policy = DQNPolicy(self.cfg.policy, model=model)
+        self.policy = PPOOffPolicy(self.cfg.policy, model=model)
         if policy_state_dict is not None:
             self.policy.learn_mode.load_state_dict(policy_state_dict)
-        path = "/mnt/nfs/gaoruoyu"
-        self.checkpoint_save_dir = os.path.join(path, self.exp_name, "ckpt")
+        self.checkpoint_save_dir = os.path.join(self.exp_name, "ckpt")
 
     def train(
         self,
         step: int = int(1e7),
         collector_env_num: int = 4,
         evaluator_env_num: int = 4,
-        n_iter_save_ckpt: int = 100000,
+        n_iter_log_show: int = 500,
+        n_iter_save_ckpt: int = 1000,
         context: Optional[str] = None,
         debug: bool = False,
         wandb_sweep: bool = False,
@@ -94,18 +90,12 @@ class DQNAgent:
 
         with task.start(ctx=OnlineRLContext()):
             task.use(interaction_evaluator(self.cfg, self.policy.eval_mode, evaluator_env))
-            task.use(eps_greedy_handler(self.cfg))
-            task.use(
-                StepCollector(
-                    self.cfg,
-                    self.policy.collect_mode,
-                    collector_env,
-                    random_collect_size=self.cfg.policy.random_collect_size \
-                        if hasattr(self.cfg.policy, 'random_collect_size') else 0,
-                )
-            )
-            task.use(nstep_reward_enhancer(self.cfg))
-            task.use(data_pusher(self.cfg, self.buffer_))
+            task.use(StepCollector(
+                self.cfg,
+                self.policy.collect_mode,
+                collector_env,
+            ))
+            task.use(gae_estimator(self.cfg, self.policy.collect_mode, self.buffer_))
             task.use(OffPolicyLearner(self.cfg, self.policy.learn_mode, self.buffer_))
             task.use(CkptSaver(policy=self.policy, save_dir=self.checkpoint_save_dir, train_freq=n_iter_save_ckpt))
             task.use(
@@ -146,7 +136,7 @@ class DQNAgent:
                 obs = ttorch.as_tensor(obs).unsqueeze(0)
                 if cuda and torch.cuda.is_available():
                     obs = obs.cuda()
-                action = forward_fn(obs)["action"]
+                action = forward_fn(obs, mode='compute_actor')["action"]
                 # squeeze means delete batch dim, i.e. (1, A) -> (A, )
                 action = action.squeeze(0).detach().cpu().numpy()
                 return action
@@ -166,7 +156,7 @@ class DQNAgent:
             step += 1
             if done:
                 break
-        logging.info(f'DQN deploy is finished, final episode return with {step} steps is: {return_}')
+        logging.info(f'PPOOffPolicy deploy is finished, final episode return with {step} steps is: {return_}')
 
         return return_
 
@@ -199,7 +189,7 @@ class DQNAgent:
             task.use(offline_data_saver(save_data_path, data_type='hdf5'))
             task.run(max_step=1)
         logging.info(
-            f'DQN collecting is finished, more than {n_sample} samples are collected and saved in `{save_data_path}`'
+            f'PPOOffPolicy collecting is finished, more than {n_sample} samples are collected and saved in `{save_data_path}`'
         )
 
     def batch_evaluate(
@@ -244,8 +234,6 @@ class DQNAgent:
 
     @property
     def best(self):
-        print("xxxxx")
-        print(os.path.join(self.checkpoint_save_dir, "eval.pth.tar"))
         best_model_file_path = os.path.join(self.checkpoint_save_dir, "eval.pth.tar")
         # Load best model if it exists
         if os.path.exists(best_model_file_path):
